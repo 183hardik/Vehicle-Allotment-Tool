@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Kirana Vehicle Planner — Grouped Kirana + Depot</title>
+<style>
+  :root{
+    --purple:#4b0082;
+    --purple-2:#6a0dad;
+    --yellow:#ffd84d;
+    --light:#fffbe6;
+    --card:#fffdf3;
+  }
+  body{ font-family: "Segoe UI", Roboto, Arial, sans-serif; background: linear-gradient(180deg,#fffdf8 0%, #fff7e6 100%); color:var(--purple); margin:0; padding:18px; }
+  .wrap{ max-width:1200px; margin:0 auto; }
+  h1{ text-align:center; color:var(--purple); margin:6px 0 16px; }
+  .layout{ display:grid; grid-template-columns: 1fr 440px; gap:16px; align-items:start; }
+  .panel{ background:var(--card); padding:14px; border:2px solid var(--purple); border-radius:10px; box-shadow:0 8px 20px rgba(75,0,130,0.08); }
+  .panel h2{ margin:0 0 8px; color:var(--purple); font-size:18px; border-bottom:2px solid var(--yellow); padding-bottom:6px; }
+  .row{ display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  label{ width:140px; font-weight:700; text-align:right; color:var(--purple); }
+  input[type="text"], input[type="number"]{ padding:8px; border-radius:8px; border:2px solid var(--purple); background:var(--light); color:var(--purple); font-weight:600; }
+  button.primary{ background:var(--purple); color:var(--yellow); padding:8px 12px; border-radius:8px; border:none; font-weight:800; cursor:pointer; }
+  button.ghost{ background:transparent; border:1px solid var(--purple); color:var(--purple); padding:6px 10px; border-radius:6px; cursor:pointer; }
+  table{ width:100%; border-collapse:collapse; margin-top:8px; font-size:13px; }
+  th,td{ border:1px solid rgba(75,0,130,0.08); padding:6px 8px; text-align:left; vertical-align:middle; }
+  th{ background:var(--light); color:var(--purple); }
+  .small{ font-size:12px; color:#444; }
+  .notice{ font-size:13px; color:#333; margin-top:8px; text-align:center; }
+  .vehicle{ border-radius:8px; padding:8px; border:1px dashed rgba(75,0,130,0.12); margin-bottom:8px; background:#fff; }
+  .warn{ color:#9b1c1c; font-weight:800; margin-top:6px; }
+  a.maplink{ color:var(--purple); font-weight:800; text-decoration:none; border-bottom:2px dotted var(--purple); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Kirana Vehicle Planner</h1>
+    <div class="layout">
+      <!-- LEFT: input and DB -->
+      <div class="panel">
+        <h2>Orders (editable)</h2>
+        <div class="row" style="justify-content:space-between">
+          <div class="small">Depot (start) is fixed to <strong>Bengaluru center</strong>: <em>Lat 12.9716, Lng 77.5946</em>.</div>
+          <div>
+            <button id="btnAddRow" class="primary">Add Row</button>
+            <button id="btnClearRows" class="ghost">Clear</button>
+            <button id="btnPlan" class="primary">Plan Vehicles</button>
+          </div>
+        </div>
+
+        <table id="ordersTable" aria-label="Orders table">
+          <thead>
+            <tr>
+              <th>#</th><th>Order ID</th><th>Kirana Name</th><th>Kirana Lat</th><th>Kirana Lng</th>
+              <th>Parcel L×B×H (cm)</th><th>Return?</th><th>Direct Addr</th><th>Direct Lat</th><th>Direct Lng</th><th>Del</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+
+        <div class="notice">Vehicle internal dims: <strong>220 × 149 × 149 cm</strong>. Max <strong>3 distinct kirana</strong> stops per vehicle. Direct deliveries are loaded if space available.</div>
+      </div>
+
+      <!-- RIGHT: results -->
+      <div class="panel">
+        <h2>Plan & Routes</h2>
+        <div id="resultSummary" class="small">No plan yet.</div>
+        <div id="vehiclesArea" style="margin-top:10px;"></div>
+        <div id="warnings"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ---------------------------
+  Configuration & utilities
+---------------------------*/
+const DEPOT_LAT = 12.9716; // Bengaluru center
+const DEPOT_LNG = 77.5946;
+const VEH_DIMS = [220,149,149];
+const VEH_VOLUME = VEH_DIMS[0]*VEH_DIMS[1]*VEH_DIMS[2];
+const MAX_KIRANA_PER_VEH = 3;
+const BASE_SPEED_KMH = 30;
+const DROP_MINUTES = 6;
+const TRAFFIC_MIN = 1.0, TRAFFIC_MAX = 1.25;
+
+function toRad(d){ return d * Math.PI/180; }
+function haversine(lat1,lon1,lat2,lon2){
+  const R=6371000; const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  const c=2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R*c;
+}
+function permutations(arr){
+  if(arr.length<=1) return [arr.slice()];
+  const res=[];
+  for(let i=0;i<arr.length;i++){
+    const cur=arr[i];
+    const rest=arr.slice(0,i).concat(arr.slice(i+1));
+    const perms=permutations(rest);
+    for(const p of perms) res.push([cur].concat(p));
+  }
+  return res;
+}
+
+/* ---------------------------
+  Orders table (editable) - prefilled sample rows
+---------------------------*/
+const ordersTableBody = document.querySelector('#ordersTable tbody');
+
+function addRow(initial={}){
+  const tr=document.createElement('tr');
+  tr.innerHTML = `
+    <td class="idx"></td>
+    <td><input class="orderId" type="text" value="${initial.orderId||''}" /></td>
+    <td><input class="kiranaName" type="text" value="${initial.kiranaName||''}" /></td>
+    <td><input class="kiranaLat" type="number" step="any" value="${initial.kiranaLat||''}" /></td>
+    <td><input class="kiranaLng" type="number" step="any" value="${initial.kiranaLng||''}" /></td>
+    <td style="white-space:nowrap;">
+      <input class="dimL" type="number" placeholder="L" style="width:56px" value="${initial.dimL||''}" /> ×
+      <input class="dimB" type="number" placeholder="B" style="width:56px" value="${initial.dimB||''}" /> ×
+      <input class="dimH" type="number" placeholder="H" style="width:56px" value="${initial.dimH||''}" />
+    </td>
+    <td style="text-align:center;"><input class="isReturn" type="checkbox" ${initial.isReturn? 'checked':''} /></td>
+    <td><input class="directAddr" type="text" value="${initial.directAddr||''}" /></td>
+    <td><input class="directLat" type="number" step="any" value="${initial.directLat||''}" /></td>
+    <td><input class="directLng" type="number" step="any" value="${initial.directLng||''}" /></td>
+    <td style="text-align:center"><button class="delBtn">Del</button></td>
+  `;
+  ordersTableBody.appendChild(tr);
+  tr.querySelector('.delBtn').addEventListener('click', ()=>{ tr.remove(); refreshIdx(); });
+  refreshIdx();
+}
+
+function refreshIdx(){ Array.from(ordersTableBody.querySelectorAll('tr')).forEach((tr,i)=> tr.querySelector('.idx').textContent = i+1); }
+
+document.getElementById('btnAddRow').addEventListener('click', ()=> addRow());
+document.getElementById('btnClearRows').addEventListener('click', ()=> { if(confirm('Clear all rows?')){ ordersTableBody.innerHTML=''; refreshIdx(); } });
+
+/* Prefill sample data (Bengaluru) - you can edit these cells */
+const prefilled = [
+  {orderId:'K1001', kiranaName:'Kirana A', kiranaLat:12.9718, kiranaLng:77.5940, dimL:40, dimB:30, dimH:20, isReturn:false},
+  {orderId:'K1002', kiranaName:'Kirana A', kiranaLat:12.9718, kiranaLng:77.5940, dimL:35, dimB:30, dimH:15, isReturn:true},
+  {orderId:'K1003', kiranaName:'Kirana B', kiranaLat:12.9725, kiranaLng:77.5950, dimL:50, dimB:40, dimH:30, isReturn:false},
+  {orderId:'K1004', kiranaName:'Kirana C', kiranaLat:12.9709, kiranaLng:77.5932, dimL:60, dimB:50, dimH:40, isReturn:false},
+  {orderId:'D2001', kiranaName:'', directAddr:'Customer X', directLat:12.9732, directLng:77.5955, dimL:30, dimB:20, dimH:10, isReturn:false},
+  {orderId:'D2002', kiranaName:'', directAddr:'Customer Y', directLat:12.9698, directLng:77.5930, dimL:45, dimB:30, dimH:20, isReturn:false},
+  {orderId:'K1005', kiranaName:'Kirana B', kiranaLat:12.9725, kiranaLng:77.5950, dimL:30, dimB:25, dimH:20, isReturn:true},
+  {orderId:'K1006', kiranaName:'Kirana D', kiranaLat:12.9688, kiranaLng:77.5945, dimL:100, dimB:80, dimH:30, isReturn:false} // larger one as test
+];
+for(const r of prefilled) addRow(r);
+
+/* ---------------------------
+  Read orders + group kirana orders by stopName
+---------------------------*/
+function readOrders(){
+  const rows = Array.from(ordersTableBody.querySelectorAll('tr'));
+  const orders = [];
+  for(const tr of rows){
+    const orderId = tr.querySelector('.orderId').value.trim();
+    const kiranaName = tr.querySelector('.kiranaName').value.trim();
+    const kiranaLat = parseFloat(tr.querySelector('.kiranaLat').value);
+    const kiranaLng = parseFloat(tr.querySelector('.kiranaLng').value);
+    const dimL = parseFloat(tr.querySelector('.dimL').value)||0;
+    const dimB = parseFloat(tr.querySelector('.dimB').value)||0;
+    const dimH = parseFloat(tr.querySelector('.dimH').value)||0;
+    const isReturn = tr.querySelector('.isReturn').checked;
+    const directAddr = tr.querySelector('.directAddr').value.trim();
+    const directLat = parseFloat(tr.querySelector('.directLat').value);
+    const directLng = parseFloat(tr.querySelector('.directLng').value);
+
+    // determine stop coordinates
+    let stopName='', stopLat=null, stopLng=null, isDirect=false;
+    if(directAddr !== '' && !isNaN(directLat) && !isNaN(directLng)){
+      stopName = directAddr; stopLat = directLat; stopLng = directLng; isDirect = true;
+    } else if(kiranaName !== '' && !isNaN(kiranaLat) && !isNaN(kiranaLng)){
+      stopName = kiranaName; stopLat = kiranaLat; stopLng = kiranaLng; isDirect = false;
+    } else {
+      // incomplete, skip
+      continue;
+    }
+
+    const dims = [dimL, dimB, dimH];
+    const volume = dims[0]*dims[1]*dims[2];
+    const fits = permutations(dims).some(p => p[0] <= VEH_DIMS[0] && p[1] <= VEH_DIMS[1] && p[2] <= VEH_DIMS[2]);
+
+    orders.push({ orderId, stopName, stopLat, stopLng, kiranaName, isDirect, dimL:dims[0], dimB:dims[1], dimH:dims[2], volume, fits, isReturn });
+  }
+  return orders;
+}
+
+/* ---------------------------
+  Group kirana orders by stopName (for non-direct)
+  Each group counts as 1 kirana slot; group volume is sum of its orders
+---------------------------*/
+function groupKiranaOrders(orders){
+  // only non-direct kirana orders
+  const kiranaOrders = orders.filter(o => !o.isDirect);
+  const groups = {};
+  for(const o of kiranaOrders){
+    const key = o.stopName;
+    if(!groups[key]) groups[key] = { stopName: o.stopName, stopLat: o.stopLat, stopLng: o.stopLng, orders: [], totalVolume:0, anyNotFit:false, hasReturn:false };
+    groups[key].orders.push(o);
+    groups[key].totalVolume += o.volume;
+    if(!o.fits) groups[key].anyNotFit = true;
+    if(o.isReturn) groups[key].hasReturn = true;
+  }
+  // convert to array
+  return Object.values(groups);
+}
+
+/* ---------------------------
+  Main planning:
+   - allocate kirana groups (each counts as 1 slot) such that each vehicle <= 3 kirana groups
+   - ensure all orders belonging to same kirana group assigned together on same vehicle
+   - pack by volume and rotation check (if any order in group doesn't fit physically -> warn)
+   - fill remaining space with direct orders (per-order)
+---------------------------*/
+function planVehicles(){
+  const orders = readOrders();
+  if(orders.length===0){ alert('No valid orders in table.'); return; }
+
+  const warnings = [];
+  const cannotFit = orders.filter(o => !o.fits);
+  if(cannotFit.length) warnings.push(`${cannotFit.length} parcel(s) cannot fit physically in vehicle due to dimensions.`);
+
+  const kiranaGroups = groupKiranaOrders(orders);
+  const directOrders = orders.filter(o => o.isDirect);
+
+  // sort kirana groups by totalVolume descending (best-fit decreasing)
+  kiranaGroups.sort((a,b)=>b.totalVolume - a.totalVolume);
+
+  // vehicle pool
+  let vehicles = [];
+  let vid = 1;
+  function newVehicle(){
+    return { id: vid++, assignedOrders: [], assignedKiranaStops: new Set(), usedVolume:0, trafficMult: (Math.random()*(TRAFFIC_MAX-TRAFFIC_MIN)+TRAFFIC_MIN) };
+  }
+
+  // initial estimated vehicles: ceil(number of kirana groups / MAX_KIRANA_PER_VEH)
+  let initial = Math.max(1, Math.ceil(kiranaGroups.length / MAX_KIRANA_PER_VEH));
+  for(let i=0;i<initial;i++) vehicles.push(newVehicle());
+
+  // assign kirana groups: each group must be placed wholly; counts as one kirana slot.
+  for(const g of kiranaGroups){
+    // if anyNotFit true, warn but still try to pack (we treat as can't fit if any order doesn't fit)
+    if(g.anyNotFit){
+      warnings.push(`Kirana ${g.stopName} has at least one parcel that cannot be dimension-fit; it may not be placed.`);
+    }
+    // try to place in existing vehicle with free kirana slots (<3) and volume available
+    let placed=false;
+    vehicles.sort((a,b)=>{
+      if(a.assignedKiranaStops.size !== b.assignedKiranaStops.size) return a.assignedKiranaStops.size - b.assignedKiranaStops.size;
+      return (VEH_VOLUME - b.usedVolume) - (VEH_VOLUME - a.usedVolume);
+    });
+    for(const v of vehicles){
+      if(v.assignedKiranaStops.size >= MAX_KIRANA_PER_VEH) continue;
+      if(v.usedVolume + g.totalVolume <= VEH_VOLUME && !g.anyNotFit){
+        // assign all orders in group to this vehicle
+        for(const o of g.orders){ v.assignedOrders.push(o); }
+        v.assignedKiranaStops.add(g.stopName);
+        v.usedVolume += g.totalVolume;
+        placed=true; break;
+      }
+    }
+    if(!placed){
+      // create new vehicle and place (if fits)
+      const nv = newVehicle();
+      if(g.totalVolume <= VEH_VOLUME && !g.anyNotFit){
+        for(const o of g.orders) nv.assignedOrders.push(o);
+        nv.assignedKiranaStops.add(g.stopName);
+        nv.usedVolume += g.totalVolume;
+        vehicles.push(nv);
+      } else {
+        warnings.push(`Kirana ${g.stopName} cannot be allocated due to size constraints.`);
+      }
+    }
+  }
+
+  // After kirana allocation, fill with direct orders greedily by proximity to vehicle centroid
+  const unassignedDirect = new Set(directOrders.map(d=>d.orderId));
+  for(const v of vehicles){
+    // compute centroid
+    let centroid = { lat: DEPOT_LAT, lng: DEPOT_LNG };
+    if(v.assignedOrders.length>0){
+      centroid.lat = v.assignedOrders.reduce((s,o)=>s+o.stopLat,0)/v.assignedOrders.length;
+      centroid.lng = v.assignedOrders.reduce((s,o)=>s+o.stopLng,0)/v.assignedOrders.length;
+    }
+    // sort direct orders by distance
+    const candidates = directOrders.filter(o=>unassignedDirect.has(o.orderId) && o.fits && (v.usedVolume + o.volume <= VEH_VOLUME))
+      .map(o=>({ o, d: haversine(centroid.lat, centroid.lng, o.stopLat, o.stopLng) }))
+      .sort((a,b)=>a.d - b.d);
+    for(const c of candidates){
+      if(v.usedVolume + c.o.volume <= VEH_VOLUME){
+        v.assignedOrders.push(c.o);
+        v.usedVolume += c.o.volume;
+        unassignedDirect.delete(c.o.orderId);
+      }
+    }
+  }
+
+  // any remaining direct orders -> create new vehicles for them as needed
+  for(const oid of Array.from(unassignedDirect)){
+    const o = directOrders.find(d=>d.orderId===oid);
+    if(!o) continue;
+    let placed=false;
+    for(const v of vehicles){
+      if(v.usedVolume + o.volume <= VEH_VOLUME && o.fits){
+        v.assignedOrders.push(o);
+        v.usedVolume += o.volume;
+        placed=true; break;
+      }
+    }
+    if(!placed){
+      const nv=newVehicle();
+      if(o.volume <= VEH_VOLUME && o.fits){
+        nv.assignedOrders.push(o);
+        nv.usedVolume += o.volume;
+        vehicles.push(nv);
+        unassignedDirect.delete(oid);
+      } else {
+        warnings.push(`Direct order ${o.orderId} cannot be placed due to dimensions.`);
+      }
+    }
+  }
+
+  // Build route for each vehicle: start at fixed depot, ensure for each kirana that if it has both drop and pickup,
+  // we schedule drop before pickup (i.e., if same stop has both types, order them: drops (isReturn=false) then pickups (isReturn=true))
+  const vehiclesResult = vehicles.map(v=>{
+    const stopsMap = {};
+    // group stops by stopName keeping both drop and pickup entries if exist
+    for(const o of v.assignedOrders){
+      const key = o.stopName + '|' + o.stopLat + '|' + o.stopLng;
+      if(!stopsMap[key]) stopsMap[key] = { stopName: o.stopName, lat:o.stopLat, lng:o.stopLng, orders: [] };
+      stopsMap[key].orders.push(o);
+    }
+    // create stops array where each stop may have multiple orders; we will ensure in-route that at that stop drops happen before pickups
+    const stops = Object.values(stopsMap);
+
+    if(stops.length === 0){
+      return { id: v.id, assignedOrders: v.assignedOrders, stops: [], distance:0, durationMin:0, utilization: Math.round(v.usedVolume/VEH_VOLUME*100), trafficMult: v.trafficMult };
+    }
+
+    // nearest neighbor from depot (simple)
+    const unvis = stops.slice();
+    const route = [];
+    let cur = { lat: DEPOT_LAT, lng: DEPOT_LNG };
+    while(unvis.length){
+      unvis.sort((a,b)=> {
+        const da = haversine(cur.lat,cur.lng,a.lat,a.lng);
+        const db = haversine(cur.lat,cur.lng,b.lat,b.lng);
+        return da - db;
+      });
+      const next = unvis.shift();
+      // reorder orders at this stop: drop (isReturn=false) first, pickups later.
+      next.orders.sort((x,y)=> (x.isReturn === y.isReturn) ? 0 : (x.isReturn? 1 : -1));
+      route.push(next);
+      cur = { lat: next.lat, lng: next.lng };
+    }
+
+    // compute distance & duration (from depot through route)
+    let totalDist = 0; cur = { lat: DEPOT_LAT, lng: DEPOT_LNG };
+    for(const s of route){
+      totalDist += haversine(cur.lat,cur.lng,s.lat,s.lng);
+      cur = { lat: s.lat, lng: s.lng };
+    }
+    const travelMin = (totalDist/1000 / BASE_SPEED_KMH) * 60 * v.trafficMult;
+    const stopsCount = route.reduce((sum,s)=> sum + s.orders.length, 0);
+    const durationMin = Math.round(travelMin + stopsCount * DROP_MINUTES);
+
+    // produce flattened assignedOrders order sequence info
+    const orderedAssigned = [];
+    for(const s of route){
+      for(const ord of s.orders){
+        orderedAssigned.push(ord);
+      }
+    }
+
+    return {
+      id: v.id,
+      assignedOrders: orderedAssigned,
+      stops: route,
+      depot: { lat: DEPOT_LAT, lng: DEPOT_LNG },
+      distance: Math.round(totalDist),
+      durationMin,
+      utilization: Math.round(v.usedVolume/VEH_VOLUME*100),
+      trafficMult: v.trafficMult
+    };
+  });
+
+  renderPlan(vehiclesResult, warnings);
+}
+
+/* ---------------------------
+  Render results + Google Maps link
+---------------------------*/
+function renderPlan(vehiclesResult, warnings){
+  const area = document.getElementById('vehiclesArea');
+  const warnEl = document.getElementById('warnings');
+  const summary = document.getElementById('resultSummary');
+  area.innerHTML = ''; warnEl.innerHTML='';
+
+  const active = vehiclesResult.filter(v=> v.stops && v.stops.length>0);
+  summary.innerHTML = `<strong>${active.length}</strong> vehicle(s) planned. Depot: Bengaluru center (${DEPOT_LAT}, ${DEPOT_LNG})`;
+
+  if(warnings.length){
+    warnEl.innerHTML = warnings.map(w => `<div class="warn">${w}</div>`).join('');
+  }
+
+  vehiclesResult.forEach(v=>{
+    const div = document.createElement('div'); div.className='vehicle';
+    if(!v.stops || v.stops.length===0){
+      div.innerHTML = `<div><strong>Vehicle ${v.id}</strong> — no assigned stops</div>`;
+      area.appendChild(div); return;
+    }
+    const stopsHtml = v.stops.map((s,idx)=>{
+      const ordersList = s.orders.map(o=> `${o.orderId}${o.isReturn? ' (Return)':''}${o.isDirect? ' (Direct)':''}`).join(', ');
+      return `<div style="margin-bottom:6px;"><strong>${idx+1}. ${s.stopName}</strong> — Orders: ${ordersList}<br/><span class="small">(${s.lat.toFixed(6)}, ${s.lng.toFixed(6)})</span></div>`;
+    }).join('');
+    // build Google Maps directions: origin = depot, waypoints = stops lat,lng joined; note: Google may truncate if too many.
+    const coords = v.stops.map(s => `${s.lat},${s.lng}`);
+    const gmapsUrl = `https://www.google.com/maps/dir/${DEPOT_LAT},${DEPOT_LNG}/${coords.join('/')}`;
+
+    div.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>Vehicle ${v.id}</strong> — Utilization: ${v.utilization}% — Stops: ${v.stops.length}</div>
+        <div><a class="maplink" href="${gmapsUrl}" target="_blank" rel="noopener">Open route in Google Maps</a></div>
+      </div>
+      <div style="margin-top:8px;" class="small">Distance: <strong>${(v.distance/1000).toFixed(2)} km</strong> • Est. Duration: <strong>${v.durationMin} min</strong> • Traffic mult: ${v.trafficMult.toFixed(2)}</div>
+      <div style="margin-top:8px">${stopsHtml}</div>
+    `;
+    area.appendChild(div);
+  });
+}
+
+/* ---------------------------
+  wire the Plan button
+---------------------------*/
+document.getElementById('btnPlan').addEventListener('click', planVehicles);
+</script>
+</body>
+</html>
